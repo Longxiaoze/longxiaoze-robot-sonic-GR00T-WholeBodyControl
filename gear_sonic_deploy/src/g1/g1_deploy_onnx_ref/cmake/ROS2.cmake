@@ -53,6 +53,12 @@ endif()
 
 list(REMOVE_DUPLICATES ROS2_INCLUDE_DIRS)
 
+function(target_add_ros2_include_dirs_after target_name)
+  foreach(ros2_include_dir ${ROS2_INCLUDE_DIRS})
+    target_compile_options(${target_name} PRIVATE "SHELL:-idirafter ${ros2_include_dir}")
+  endforeach()
+endfunction()
+
 # Essential ROS2 libraries for basic pub/sub functionality
 set(ESSENTIAL_LIB_PATTERNS
   "librclcpp.so*" "librcl.so*" "librcl_yaml_param_parser.so*"
@@ -101,7 +107,7 @@ set(TEST_EXECUTABLE_NAME test_ros2)
 add_executable(${TEST_EXECUTABLE_NAME} tests/test_ros2.cpp)
 
 target_include_directories(${TEST_EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/)
-target_include_directories(${TEST_EXECUTABLE_NAME} PRIVATE ${ROS2_INCLUDE_DIRS})
+target_add_ros2_include_dirs_after(${TEST_EXECUTABLE_NAME})
 target_link_libraries(${TEST_EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
 target_compile_definitions(${TEST_EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
 

@@ -5,6 +5,39 @@
 
 echo "🔧 Setting up G1 Deploy environment..."
 
+strip_anaconda_from_path() {
+    local filtered=""
+    local entry
+
+    IFS=':' read -ra path_entries <<< "${PATH:-}"
+    for entry in "${path_entries[@]}"; do
+        if [[ "$entry" == *"/anaconda"* || "$entry" == *"/miniconda"* || "$entry" == *"/mambaforge"* || "$entry" == *"/miniforge"* || "$entry" == *"/.conda"* ]]; then
+            continue
+        fi
+
+        if [ -z "$filtered" ]; then
+            filtered="$entry"
+        else
+            filtered="$filtered:$entry"
+        fi
+    done
+
+    export PATH="$filtered"
+}
+
+# Keep this deploy shell independent of Anaconda/conda. The project uses its
+# own release binary and explicit virtualenvs; conda paths can shadow system
+# tools, headers and libraries during ROS 2 deployment builds.
+strip_anaconda_from_path
+while IFS='=' read -r name _; do
+    if [[ "$name" == CONDA_* ]]; then
+        unset "$name"
+    fi
+done < <(env)
+unset _CE_CONDA _CE_M
+hash -r 2>/dev/null || true
+echo "✅ Anaconda/conda removed from deploy shell PATH"
+
 # Run jetson_clocks on Jetson systems (bare-metal only)
 if command -v jetson_clocks &> /dev/null; then
     if [ -f "/.dockerenv" ]; then
@@ -164,6 +197,12 @@ fi
 
 # TensorRT Environment Setup
 # Check if TensorRT_ROOT is already set, if not try to load from .bashrc
+if [ -n "$TensorRT_ROOT" ] && [ ! -d "$TensorRT_ROOT/lib" ]; then
+    echo "⚠️  TensorRT_ROOT is set but invalid: $TensorRT_ROOT"
+    echo "   Expected TensorRT libraries under: $TensorRT_ROOT/lib"
+    unset TensorRT_ROOT
+fi
+
 if [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
     # Extract TensorRT_ROOT from .bashrc if it exists
     BASHRC_TENSORRT=$(grep -o 'export TensorRT_ROOT=.*' "$HOME/.bashrc" | head -n1 | cut -d'=' -f2 | tr -d '"' | envsubst)
@@ -305,6 +344,33 @@ if [ -d "/opt/onnxruntime/lib" ]; then
     export LD_LIBRARY_PATH="/opt/onnxruntime/lib:$LD_LIBRARY_PATH"
 fi
 
+# Keep Unitree SDK's bundled CycloneDDS ahead of ROS2's libddsc. Mixing the
+# bundled libddscxx with ROS2's libddsc can abort during early DDS writes.
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UNITREE_DDS_LIB_DIR="$PROJECT_ROOT/thirdparty/unitree_sdk2/thirdparty/lib/$ARCH"
+if [ -d "$UNITREE_DDS_LIB_DIR" ]; then
+    FILTERED_LD_LIBRARY_PATH=""
+    IFS=':' read -ra ld_entries <<< "${LD_LIBRARY_PATH:-}"
+    for entry in "${ld_entries[@]}"; do
+        if [ -z "$entry" ] || [ "$entry" = "$UNITREE_DDS_LIB_DIR" ]; then
+            continue
+        fi
+
+        if [ -z "$FILTERED_LD_LIBRARY_PATH" ]; then
+            FILTERED_LD_LIBRARY_PATH="$entry"
+        else
+            FILTERED_LD_LIBRARY_PATH="$FILTERED_LD_LIBRARY_PATH:$entry"
+        fi
+    done
+
+    if [ -n "$FILTERED_LD_LIBRARY_PATH" ]; then
+        export LD_LIBRARY_PATH="$UNITREE_DDS_LIB_DIR:$FILTERED_LD_LIBRARY_PATH"
+    else
+        export LD_LIBRARY_PATH="$UNITREE_DDS_LIB_DIR"
+    fi
+    echo "✅ Unitree SDK DDS libraries prioritized: $UNITREE_DDS_LIB_DIR"
+fi
+
 # Set up Git LFS (if not already done)
 if command -v git-lfs &> /dev/null; then
     git lfs install &> /dev/null
@@ -348,4 +414,3 @@ echo ""
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
 fi
-

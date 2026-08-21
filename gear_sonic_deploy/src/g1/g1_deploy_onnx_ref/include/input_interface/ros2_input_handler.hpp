@@ -29,7 +29,7 @@
  *
  *   base_height_command | Mode
  *   --------------------|------
- *   0.72 – 0.88         | WALK (or SLOW_WALK depending on locomotion_mode flag)
+ *   0.72 – 0.88         | locomotion_mode selected by the ROS 2 sender
  *   0.50 – 0.72         | SQUAT (static)
  *   0.10 – 0.50         | KNEEL (static)
  *
@@ -86,6 +86,7 @@ struct ControlGoalMsg {
     /// Wrist pose in [x,y,z, qw,qx,qy,qz] × 2 (left then right).
     std::array<double, 14> wrist_pose = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
                                           0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
+    bool has_wrist_pose = false;  ///< True only when a wrist_pose field is present.
     
     // IK-processed wrist poses (4×4 transformation matrices, row-major flattened)
     std::array<double, 16> left_wrist_after_ik = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};   ///< Left wrist after IK.
@@ -100,7 +101,7 @@ struct ControlGoalMsg {
     
     double base_height_command = 0.78;        ///< Desired base height (metres, valid range 0.1–0.88).
     bool toggle_policy_action = false;        ///< Edge-triggered toggle: maps to start/stop control.
-    int locomotion_mode = 0;                  ///< 0 = slow walk (custom speed), 1 = fast walk (default speed).
+    int locomotion_mode = 0;                  ///< Planner V2 mode ID (0–26).
     
     /// Dex3 hand joint positions (7 DOF per hand).
     std::array<double, 7> left_hand_joint = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
@@ -132,7 +133,7 @@ public:
     // ========================================
     // DEBUG CONTROL FLAG
     // ========================================
-    static constexpr bool DEBUG_LOGGING = true;  // Set to false to disable debug logs
+    static constexpr bool DEBUG_LOGGING = false;  // Production navigation should not log at control rate
 
     // Constructor - initializes ROS2 node and subscribers
     explicit ROS2InputHandler(bool use_ik_mode = true, const std::string& node_name = "g1_input_handler") 
@@ -323,6 +324,7 @@ public:
             // Update navigate_cmd and base_height_command from control goal
             navigate_cmd_from_teleop_ = control_goal_buffer_.navigate_cmd;
             base_height_command_ = control_goal_buffer_.base_height_command;
+            locomotion_mode_from_teleop_ = control_goal_buffer_.locomotion_mode;
             use_teleop_navigate_cmd_ = true;
             
             // Handle toggle_policy_action (edge-triggered toggle between start/stop)
@@ -344,21 +346,6 @@ public:
                 
                 // Clear the trigger after reading (edge-triggered behavior)
                 control_goal_buffer_.toggle_policy_action = false;
-            }
-            
-            // Handle locomotion_mode (direct state: 0 = slow walk, 1 = fast walk)
-            locomotion_mode_is_fast_ = (control_goal_buffer_.locomotion_mode == 1);
-            
-            if constexpr (DEBUG_LOGGING) {
-                static int prev_locomotion_mode = -1;
-                if (prev_locomotion_mode != control_goal_buffer_.locomotion_mode) {
-                    if (locomotion_mode_is_fast_) {
-                        std::cout << "[ROS2 DEBUG] locomotion_mode: FAST WALK (default speed, mode 2)" << std::endl;
-                    } else {
-                        std::cout << "[ROS2 DEBUG] locomotion_mode: SLOW WALK (custom speed, mode 1)" << std::endl;
-                    }
-                    prev_locomotion_mode = control_goal_buffer_.locomotion_mode;
-                }
             }
             
             // Update hand poses from teleop
@@ -469,7 +456,7 @@ public:
                 // Update buffers
                 vr_3point_position_.SetData(vr_position);
                 vr_3point_orientation_.SetData(vr_orientation);
-            } else {
+            } else if (control_goal_buffer_.has_wrist_pose) {
                 // Fallback: Use standard wrist_pose format (14 doubles)
                 vr_position[0] = control_goal_buffer_.wrist_pose[0];  // left wrist x
                 vr_position[1] = control_goal_buffer_.wrist_pose[1];  // left wrist y
@@ -752,53 +739,72 @@ public:
 
                 double planner_moving_direction = planner_facing_angle_;
                 
-                // Determine locomotion mode based on base_height_command first
-                if (base_height >= 0.72f) {
-                    // Height 0.72-0.88: Normal walking modes
-                    if (movement_mag > 0.01f) {
-                        // Moving: use walk modes
-                        // Compute moving direction (same as gamepad logic)
-                        planner_moving_direction = std::atan2(lin_vel_y, lin_vel_x) + planner_moving_direction;
-                        
-                        // Bin the moving direction to 8 evenly spaced directions and get corresponding speed
-                        auto [binned_angle, direction_speed] = bin_angle_to_8_directions(planner_moving_direction);
-                        planner_moving_direction = binned_angle;
-                        
-                        // Compute normalized movement direction from binned angle
+                bool requested_mode_is_valid =
+                    locomotion_mode_from_teleop_ >=
+                        static_cast<int>(LocomotionMode::IDLE) &&
+                    locomotion_mode_from_teleop_ <=
+                        static_cast<int>(LocomotionMode::SCARE_WALK);
+
+                if (requested_mode_is_valid) {
+                    auto requested_mode =
+                        static_cast<LocomotionMode>(locomotion_mode_from_teleop_);
+                    bool static_mode = is_static_motion_mode(requested_mode);
+                    bool ground_mode = is_squat_motion_mode(requested_mode);
+                    final_mode = locomotion_mode_from_teleop_;
+                    final_height = ground_mode ? base_height : -1.0f;
+
+                    if (movement_mag > 0.01f && !static_mode) {
+                        planner_moving_direction =
+                            std::atan2(lin_vel_y, lin_vel_x) +
+                            planner_moving_direction;
                         final_movement[0] = std::cos(planner_moving_direction);
                         final_movement[1] = std::sin(planner_moving_direction);
                         final_movement[2] = 0.0f;
-                        
-                        if (locomotion_mode_is_fast_) {
-                            // Normal walk mode: default speed (-1)
-                            final_mode = static_cast<int>(LocomotionMode::WALK);
-                            final_speed = -1.0f;
-                        } else {
-                            // Slow walk mode: speed varies by direction (faster forward/lateral, slower backward)
+                        final_speed = std::clamp(movement_mag, 0.1, 7.5);
+                    } else {
+                        final_movement = {0.0f, 0.0f, 0.0f};
+                        final_speed = static_mode ? -1.0f : 0.0f;
+
+                        // Punch/hook clips use the facing vector even when
+                        // target speed is zero, matching keyboard/gamepad.
+                        if (requested_mode == LocomotionMode::LEFT_PUNCH ||
+                            requested_mode == LocomotionMode::RIGHT_PUNCH ||
+                            requested_mode == LocomotionMode::LEFT_HOOK ||
+                            requested_mode == LocomotionMode::RIGHT_HOOK) {
+                            final_movement = final_facing_direction;
+                        }
+                    }
+                } else if (base_height >= 0.72f) {
+                    // Defensive fallback for malformed third-party payloads.
+                    if (movement_mag > 0.01f) {
+                        planner_moving_direction =
+                            std::atan2(lin_vel_y, lin_vel_x) +
+                            planner_moving_direction;
+                        final_movement[0] = std::cos(planner_moving_direction);
+                        final_movement[1] = std::sin(planner_moving_direction);
+                        final_movement[2] = 0.0f;
+                        if (movement_mag <= 0.8) {
                             final_mode = static_cast<int>(LocomotionMode::SLOW_WALK);
-                            final_speed = direction_speed;
+                            final_speed = std::clamp(movement_mag, 0.1, 0.8);
+                        } else if (movement_mag <= 2.5) {
+                            final_mode = static_cast<int>(LocomotionMode::WALK);
+                            final_speed = std::clamp(movement_mag, 0.8, 2.5);
+                        } else {
+                            final_mode = static_cast<int>(LocomotionMode::RUN);
+                            final_speed = std::clamp(movement_mag, 2.5, 7.5);
                         }
                     } else {
-                        // No movement: idle
                         final_mode = static_cast<int>(LocomotionMode::IDLE);
-                        final_movement = {0.0f, 0.0f, 0.0f};
                         final_speed = -1.0f;
                     }
-                    final_height = -1.0f;  // Use default height for walking
-                    
-                } else if (base_height >= 0.5f) {
-                    // Height 0.5-0.72: Squat mode (static pose, no movement)
-                    final_mode = static_cast<int>(LocomotionMode::IDEL_SQUAT);
-                    final_movement = {0.0f, 0.0f, 0.0f};
-                    final_speed = -1.0f;  // Use default speed (no walking while squatting)
-                    final_height = base_height;  // Pass actual height command
-                    
+                    final_height = -1.0f;
                 } else {
-                    // Height 0.1-0.5: Kneel mode (static pose, no movement)
-                    final_mode = static_cast<int>(LocomotionMode::IDEL_KNEEL);
+                    final_mode = base_height >= 0.5f
+                        ? static_cast<int>(LocomotionMode::IDEL_SQUAT)
+                        : static_cast<int>(LocomotionMode::IDEL_KNEEL);
                     final_movement = {0.0f, 0.0f, 0.0f};
-                    final_speed = -1.0f;  // Use default speed (no walking while kneeling)
-                    final_height = base_height;  // Pass actual height command
+                    final_speed = -1.0f;
+                    final_height = base_height;
                 }
             }
 
@@ -878,8 +884,6 @@ private:
     // Control-toggle state
     // ------------------------------------------------------------------
     bool control_is_active_ = false;       ///< Tracks the toggle state for toggle_policy_action.
-    bool locomotion_mode_is_fast_ = false;  ///< false = SLOW_WALK (custom speed), true = WALK (default speed).
-    
     // ------------------------------------------------------------------
     // Per-frame control flags (reset in update())
     // ------------------------------------------------------------------
@@ -893,6 +897,7 @@ private:
     std::array<double, 3> navigate_cmd_from_teleop_ = {0.0, 0.0, 0.0};  ///< [lin_x, lin_y, ang_z].
     bool use_teleop_navigate_cmd_ = false;   ///< True while navigate_cmd is valid.
     double base_height_command_ = 0.78;      ///< Thread-safe copy of base_height_command.
+    int locomotion_mode_from_teleop_ = 0;    ///< Planner V2 mode selected by the sender.
     
     /// Accumulated facing angle (radians), integrated from ang_vel_z each frame.
     double planner_facing_angle_ = 0.0;
@@ -941,6 +946,7 @@ private:
                 auto wrist_arr = map_data["wrist_pose"].as<std::vector<double>>();
                 if (wrist_arr.size() >= 14) {
                     std::copy_n(wrist_arr.begin(), 14, msg.wrist_pose.begin());
+                    msg.has_wrist_pose = true;
                 }
             }
             
@@ -1056,7 +1062,7 @@ private:
                 msg.toggle_policy_action = map_data["toggle_policy_action"].as<bool>();
             }
             
-            // Extract locomotion_mode (int: 0 = slow walk, 1 = fast walk)
+            // Extract planner V2 mode selected by the ROS sender (0-26).
             if (map_data.count("locomotion_mode")) {
                 msg.locomotion_mode = map_data["locomotion_mode"].as<int>();
             }
@@ -1208,7 +1214,7 @@ private:
                     bool prev_toggle_policy = control_goal_buffer_.toggle_policy_action;
                     control_goal_buffer_ = goal_msg;
                     control_goal_buffer_.toggle_policy_action = prev_toggle_policy || goal_msg.toggle_policy_action;
-                    // locomotion_mode is a direct state value (0 or 1), not accumulated
+                    // locomotion_mode is a direct state value, not accumulated
                 }
                 received_control_goal_.store(true);
                 // Update timestamp for timeout tracking (using steady_clock for monotonic timing)
@@ -1267,7 +1273,7 @@ private:
      *    - right_hand_joint: double[7] (7 DOF joint positions for right hand)
      *    - base_height_command: double (desired base height)
      *    - toggle_policy_action: bool (toggle between start/stop control)
-     *    - locomotion_mode: int (0 = slow walk with custom speed, 1 = fast walk with default speed)
+     *    - locomotion_mode: int (planner V2 mode ID, 0-26)
      *    - ros_timestamp: double (ROS time in seconds for synchronization)
      *    - valid: bool (message validity flag)
      */

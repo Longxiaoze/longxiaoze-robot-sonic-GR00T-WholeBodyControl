@@ -507,9 +507,17 @@ class DefaultEnv:
 
     def check_fall(self):
         self.fall = False
-        if self.mj_data.qpos[2] < 0.2:
+        if not self.config.get("AUTO_RESET_ON_FALL", False):
+            return
+
+        fall_reset_height = float(self.config.get("FALL_RESET_HEIGHT", 0.2))
+        if self.mj_data.qpos[2] < fall_reset_height:
             self.fall = True
-            print(f"Warning: Robot has fallen, height: {self.mj_data.qpos[2]:.3f} m")
+            print(
+                "Warning: Robot has fallen, "
+                f"height: {self.mj_data.qpos[2]:.3f} m "
+                f"(< {fall_reset_height:.3f} m); resetting"
+            )
 
         if self.fall:
             self.reset()

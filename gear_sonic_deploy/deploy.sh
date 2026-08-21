@@ -204,12 +204,13 @@ show_usage() {
     echo ""
     echo "Options:"
     echo "  -h, --help              Show this help message"
+    echo "  -y, --yes               Skip the deployment confirmation prompt"
     echo "  --cp, --checkpoint PATH Set the checkpoint path (default: policy/checkpoints/example/model_step_000000)"
     echo "  --obs-config PATH       Set the observation config file (default: policy/configs/example.yaml)"
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
     echo "  --motion-data PATH      Set the motion data path (default: reference/example_motion/)"
-    echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
-    echo "  --output-type TYPE      Set the output type (default: ros2)"
+    echo "  --input-type TYPE       Set the input type (default: manager)"
+    echo "  --output-type TYPE      Set the output type (default: all)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
     echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
@@ -244,6 +245,7 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+ASSUME_YES=false
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -262,6 +264,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             show_usage
             exit 0
+            ;;
+        -y|--yes)
+            ASSUME_YES=true
+            shift
             ;;
         --cp|--checkpoint)
             if [[ -z "$2" ]]; then
@@ -571,7 +577,12 @@ else
     echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
 fi
 echo ""
-read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+if [[ "$ASSUME_YES" == true ]]; then
+    confirm="y"
+    echo -e "${GREEN}Proceeding without confirmation (--yes).${NC}"
+else
+    read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+fi
 
 if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""

@@ -89,6 +89,8 @@ def override_wbc_config(
         "waist_pitch_limit": config.waist_pitch_limit,
         "hand_torque_limit": config.hand_torque_limit,
         "enable_natural_walk": config.enable_natural_walk,
+        "AUTO_RESET_ON_FALL": config.auto_reset_on_fall,
+        "FALL_RESET_HEIGHT": config.fall_reset_height,
     }
 
     if missed_keys_only:
@@ -205,6 +207,12 @@ class BaseConfig(ArgsConfigTemplate):
     enable_natural_walk: bool = False
     """Enable natural walk mode."""
 
+    auto_reset_on_fall: bool = False
+    """Reset MuJoCo automatically when the floating-base height is too low."""
+
+    fall_reset_height: float = 0.2
+    """Floating-base height threshold for optional automatic reset, in metres."""
+
     # Teleop/Device Configuration
     body_control_device: str = "dummy"
     """Device to use for body control."""
@@ -292,6 +300,9 @@ class BaseConfig(ArgsConfigTemplate):
     """Initial operation mode."""
 
     def __post_init__(self):
+        if self.fall_reset_height <= 0.0:
+            raise ValueError("fall_reset_height must be positive")
+
         # Resolve interface
         self.interface, self.env_type = resolve_interface(self.interface)
 

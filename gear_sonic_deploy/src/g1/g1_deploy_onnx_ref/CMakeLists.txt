@@ -222,7 +222,8 @@ if(rclcpp_FOUND AND std_msgs_FOUND)
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ROS2.cmake)
   
   # Add ROS2 support to main executable (requires msgpack)
-  target_include_directories(${EXECUTABLE_NAME} PRIVATE ${ROS2_INCLUDE_DIRS} ${MSGPACK_INCLUDE_DIRS})
+  target_add_ros2_include_dirs_after(${EXECUTABLE_NAME})
+  target_include_directories(${EXECUTABLE_NAME} PRIVATE ${MSGPACK_INCLUDE_DIRS})
   target_link_libraries(${EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
   target_compile_definitions(${EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
   
