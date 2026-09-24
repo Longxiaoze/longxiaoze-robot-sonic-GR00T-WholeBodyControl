@@ -104,6 +104,7 @@
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
 #include "../include/motor_gain_scaling.hpp"
+#include "../include/lowstate_tick_gate.hpp"
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -182,6 +183,16 @@ class G1Deploy {
     int counter_;          ///< General-purpose tick counter.
     Mode mode_pr_;         ///< Ankle control mode (series PR vs. parallel AB).
     uint8_t mode_machine_; ///< Robot variant code received from LowState.
+
+    // Isaac Sim can run slower than wall time when RTX sensors and a viewport
+    // are active. In that case a wall-clock 50 Hz controller advances the
+    // reference faster than the simulated plant. The bridge writes simulation
+    // milliseconds to LowState.tick, so simulation deployments can explicitly
+    // gate policy and planner updates on that clock while the 500 Hz command
+    // writer continues to hold the latest command.
+    bool use_lowstate_clock_ = false;
+    sonic::LowStateTickGate control_tick_gate_;
+    sonic::LowStateTickGate planner_tick_gate_;
     
     // =========================================================================
     // Input interface and buffered input data
@@ -2180,7 +2191,8 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {},
+      bool use_lowstate_clock = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2191,6 +2203,7 @@ class G1Deploy {
         mode_pr_(Mode::PR),
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
+        use_lowstate_clock_(use_lowstate_clock),
         program_state_(ProgramState::INIT),
         motor_gain_scales_(motor_gain_scales),
         last_action {0.0},
@@ -2609,16 +2622,25 @@ class G1Deploy {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
       }
 
-      // create threads
+      // create threads. With the simulation clock enabled these are polling
+      // periods only; LowStateClockDue keeps logical control/planner rates at
+      // 50/10 Hz in Isaac simulation time.
+      const double control_poll_dt = use_lowstate_clock_ ? publish_dt_ : control_dt_;
+      const double planner_poll_dt = use_lowstate_clock_ ? input_dt_ : planner_dt_;
+      if (use_lowstate_clock_) {
+        std::cout << "[LowStateClock] enabled: control=20 ms planner=100 ms, "
+                  << "polling at " << control_poll_dt * 1000.0 << "/"
+                  << planner_poll_dt * 1000.0 << " ms" << std::endl;
+      }
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
                                                     &G1Deploy::LowCommandWriter, this);
       control_thread_ptr_ =
-          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
+          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_poll_dt * 1e6, &G1Deploy::Control, this);
       
       if (planner_) {
         planner_thread_ptr_ =
-          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
+          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_poll_dt * 1e6, &G1Deploy::Planner, this);
       }
           
       SetThreadPriority();
@@ -2731,6 +2753,17 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
+      if (use_lowstate_clock_) {
+        std::cout << "[LowStateClock] summary control_due="
+                  << control_tick_gate_.accepted
+                  << " control_wait=" << control_tick_gate_.skipped
+                  << " planner_due=" << planner_tick_gate_.accepted
+                  << " planner_wait=" << planner_tick_gate_.skipped
+                  << " discontinuities="
+                  << (control_tick_gate_.discontinuities
+                      + planner_tick_gate_.discontinuities)
+                  << std::endl;
+      }
       CreateDampingCommand();
       LowCommandWriter();
       std::cout << "Stop" << std::endl;
@@ -2790,6 +2823,61 @@ class G1Deploy {
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
+      return true;
+    }
+
+    /**
+     * Return true when one logical controller/planner period has elapsed on
+     * LowState.tick. Unsigned subtraction preserves the normal uint32 wrap.
+     * A backwards jump larger than half the range is a simulator reset; it is
+     * re-anchored without replaying stale control iterations. Likewise, large
+     * forward jumps are dropped instead of running several inferences against
+     * the same state.
+     */
+    bool LowStateClockDue(
+        sonic::LowStateTickGate& gate, uint32_t period_ms, const char* loop_name) {
+      if (!use_lowstate_clock_) { return true; }
+
+      const auto low_state_data = low_state_buffer_.GetDataWithTime();
+      if (!low_state_data.data) {
+        return false;
+      }
+      if (std::chrono::steady_clock::now() - low_state_data.timestamp
+          > LOW_STATE_ABSENT_THRESHOLD) {
+        // Never advance INIT or the planner from a repeatedly sampled stale
+        // state. CONTROL performs CheckSafety before reaching this gate, and
+        // INIT performs the same check as soon as a first state exists.
+        return false;
+      }
+
+      const uint32_t tick_ms = low_state_data.data->tick();
+      const bool was_initialized = gate.initialized;
+      const auto decision = gate.Observe(tick_ms, period_ms);
+      if (!was_initialized) {
+        std::cout << "[LowStateClock] " << loop_name
+                  << " synchronized at tick=" << tick_ms << " ms" << std::endl;
+        return true;
+      }
+      if (decision == sonic::LowStateTickDecision::kRebased) {
+        // Policy history, motion frame and planner state all belong to the old
+        // simulation timeline. Continuing from a rebased tick would combine
+        // those histories with a reset plant, so require a clean process
+        // restart instead of silently resuming.
+        std::cerr << "[ERROR] [LowStateClock] " << loop_name
+                  << " detected a simulation tick reset at " << tick_ms
+                  << " ms; stopping for a clean restart" << std::endl;
+        operator_state.stop = true;
+        return false;
+      }
+      if (decision == sonic::LowStateTickDecision::kWait) {
+        return false;
+      }
+      if (gate.last_advanced_periods > 4u) {
+        std::cout << "[LowStateClock] " << loop_name
+                  << " dropped " << (gate.last_advanced_periods - 1u)
+                  << " stale periods after a " << gate.last_elapsed_ms
+                  << " ms clock jump" << std::endl;
+      }
       return true;
     }
 
@@ -3599,6 +3687,9 @@ class G1Deploy {
       
       if (planner_ && planner_->planner_state_.enabled) {
         if (ls) {
+          if (!LowStateClockDue(planner_tick_gate_, 100u, "planner")) {
+            return;
+          }
           if (!planner_->planner_state_.initialized) {
             try {
               std::cout << "Initializing planner..." << std::endl;
@@ -3836,6 +3927,17 @@ class G1Deploy {
 
       switch (program_state_) {
         case ProgramState::INIT:
+          if (low_state_buffer_.GetDataWithTime().data) {
+            if (!CheckSafety()) {
+              std::cout << "[ERROR] Safety check failed during initialization."
+                        << std::endl;
+              operator_state.stop = true;
+              break;
+            }
+            if (!LowStateClockDue(control_tick_gate_, 20u, "control")) {
+              break;
+            }
+          }
           if (!InitControl()) {
             std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -3874,6 +3976,9 @@ class G1Deploy {
           if (!CheckSafety()) {
             std::cout << "[ERROR] Safety check failed, stopping control." << std::endl;
             operator_state.stop = true;
+            break;
+          }
+          if (!LowStateClockDue(control_tick_gate_, 20u, "control")) {
             break;
           }
 
@@ -4168,6 +4273,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --control-clock <wall|lowstate-tick>: advance policy/planner from wall time or LowState.tick (default: wall)" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4209,7 +4315,8 @@ int main(int argc, char const* argv[]) {
   std::string plannerFile = "";
 
   // Parse optional arguments
-  bool disableCrcCheck = false;\
+  bool disableCrcCheck = false;
+  bool useLowStateClock = false;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4238,6 +4345,21 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--control-clock") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --control-clock requires wall or lowstate-tick" << std::endl;
+        exit(1);
+      }
+      const std::string clock = argv[++i];
+      if (clock == "wall") {
+        useLowStateClock = false;
+      } else if (clock == "lowstate-tick") {
+        useLowStateClock = true;
+      } else {
+        std::cerr << "Error: --control-clock must be wall or lowstate-tick" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] Control clock: " << clock << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4506,7 +4628,8 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales
+    motor_gain_scales,
+    useLowStateClock
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
