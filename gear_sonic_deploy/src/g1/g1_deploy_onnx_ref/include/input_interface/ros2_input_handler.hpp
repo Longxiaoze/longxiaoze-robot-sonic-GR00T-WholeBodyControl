@@ -17,8 +17,9 @@
  *
  * - A locomotion **planner must be loaded** – ROS2 mode always operates through
  *   the planner (no reference-motion playback).
- * - VR 3-point tracking is always enabled; the handler populates position and
- *   orientation buffers from the received wrist / head data.
+ * - Navigation-only payloads keep the local motion encoder in mode 0. VR
+ *   3-point tracking and encoder mode 1 are enabled only while a complete
+ *   wrist/head payload is present.
  * - Supports two IK modes controlled at construction time:
  *   - `use_ik_mode = true`  – uses IK-processed transformation matrices
  *     (left_wrist_after_ik, right_wrist_after_ik, head_after_ik) with
@@ -53,6 +54,7 @@
 #include <rclcpp/exceptions/exceptions.hpp>
 #include <std_msgs/msg/byte_multi_array.hpp>  // For msgpack-serialized messages
 #include <array>
+#include <algorithm>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -135,6 +137,13 @@ public:
     // ========================================
     static constexpr bool DEBUG_LOGGING = false;  // Production navigation should not log at control rate
 
+    /// Return true only when this handler can consume a complete live VR target.
+    static bool HasUsableVRPayload(const ControlGoalMsg& goal, bool use_ik_mode) {
+        return (use_ik_mode && goal.has_ik_data) ||
+               (!use_ik_mode && goal.has_wrist_matrices) ||
+               goal.has_wrist_pose;
+    }
+
     // Constructor - initializes ROS2 node and subscribers
     explicit ROS2InputHandler(bool use_ik_mode = true, const std::string& node_name = "g1_input_handler") 
         : InputInterface() {
@@ -172,7 +181,11 @@ public:
             throw;
         }
         type_ = InputType::ROS2;
-        has_vr_3point_control_ = true;
+        // A ROS 2 transport alone does not imply that VR targets exist.  The
+        // flag is enabled by update() only after a complete wrist/head payload
+        // has been parsed.  This keeps navigation-only control on encoder mode
+        // 0, matching the keyboard/gamepad planner path.
+        has_vr_3point_control_ = false;
         use_ik_mode_ = use_ik_mode;
     }
 
@@ -349,16 +362,18 @@ public:
             }
             
             // Update hand poses from teleop
+            has_hand_joints_ = control_goal_buffer_.has_hand_joints;
             if (control_goal_buffer_.has_hand_joints) {
                 left_hand_joint_.SetData(control_goal_buffer_.left_hand_joint);
                 right_hand_joint_.SetData(control_goal_buffer_.right_hand_joint);
-                has_hand_joints_ = true;
             }
             
             // Update VR 3-point control data based on use_ik_mode_ flag
             // Build arrays first, then call SetData() on buffers
-            std::array<double, 9> vr_position;
-            std::array<double, 12> vr_orientation;
+            std::array<double, 9> vr_position{};
+            std::array<double, 12> vr_orientation{};
+            const bool has_usable_vr_payload =
+                HasUsableVRPayload(control_goal_buffer_, use_ik_mode_);
             
             if (use_ik_mode_ && control_goal_buffer_.has_ik_data) {
                 // IK mode: Use IK-processed transformation matrices
@@ -489,6 +504,11 @@ public:
                 vr_3point_orientation_.SetData(vr_orientation);
             }
 
+            // This capability flag also selects encoder mode in handle_input().
+            // Do not feed default VR poses into encoder mode 1 when the sender
+            // provided only navigation fields.
+            has_vr_3point_control_ = has_usable_vr_payload;
+
             if constexpr (DEBUG_LOGGING) {
                 static int goal_debug_counter = 0;
                 goal_debug_counter++;
@@ -541,6 +561,8 @@ public:
         } else {
             // No control goal data available
             use_teleop_navigate_cmd_ = false;
+            has_vr_3point_control_ = false;
+            has_hand_joints_ = false;
         }
     }
 
@@ -579,8 +601,8 @@ public:
                     // Planner is already on, keep it as is (don't touch initialized flag)
                     {
                         std::lock_guard<std::mutex> lock(current_motion_mutex);
-                        if (current_motion->GetEncodeMode() >= 0) {
-                            current_motion->SetEncodeMode(1);
+                        if (current_motion && current_motion->GetEncodeMode() >= 0) {
+                            current_motion->SetEncodeMode(desired_encoder_mode());
                         }
                         operator_state.play = true;
                     }
@@ -633,8 +655,8 @@ public:
                     // Play motion
                     {
                         std::lock_guard<std::mutex> lock(current_motion_mutex);
-                        if (current_motion->GetEncodeMode() == 0) {
-                            current_motion->SetEncodeMode(1);
+                        if (current_motion && current_motion->GetEncodeMode() >= 0) {
+                            current_motion->SetEncodeMode(desired_encoder_mode());
                         }
                         operator_state.play = true;
                     }
@@ -698,6 +720,20 @@ public:
             {
                 std::lock_guard<std::mutex> lock(current_motion_mutex);
                 operator_state.play = true;
+            }
+        }
+
+        // The ROS 2 stream may switch between navigation-only and whole-body
+        // messages at runtime. Keep the active motion's encoder mode aligned
+        // with the latest complete payload, including reverting to mode 0 when
+        // VR fields disappear or the stream times out.
+        {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            if (current_motion && current_motion->GetEncodeMode() >= 0) {
+                const int target_mode = desired_encoder_mode();
+                if (current_motion->GetEncodeMode() != target_mode) {
+                    current_motion->SetEncodeMode(target_mode);
+                }
             }
         }
 
@@ -847,6 +883,8 @@ public:
     void reset_data_flags() {
         received_control_goal_.store(false);
         last_control_goal_time_ns_.store(0);
+        has_vr_3point_control_ = false;
+        has_hand_joints_ = false;
     }
 
     // Get ROS timestamp in seconds (for state logging)
@@ -859,6 +897,11 @@ public:
     }
 
 private:
+    /// Encoder mode 1 consumes live VR targets; mode 0 uses planner motion only.
+    int desired_encoder_mode() const {
+        return has_vr_3point_control_.load() ? 1 : 0;
+    }
+
     // ------------------------------------------------------------------
     // ROS 2 infrastructure
     // ------------------------------------------------------------------
@@ -917,6 +960,17 @@ private:
     ControlGoalMsg parse_msgpack_control_goal(const std::vector<uint8_t>& data) {
         ControlGoalMsg msg;
         msg.valid = false;
+        bool has_left_wrist_after_ik = false;
+        bool has_right_wrist_after_ik = false;
+        bool has_head_after_ik = false;
+        bool has_left_wrist_matrix = false;
+        bool has_right_wrist_matrix = false;
+        const auto is_4x4_matrix = [](const std::vector<std::vector<double>>& matrix) {
+            return matrix.size() == 4 &&
+                   std::all_of(matrix.begin(), matrix.end(), [](const auto& row) {
+                       return row.size() == 4;
+                   });
+        };
         
         try {
             // Use msgpack-c library for clean, efficient parsing
@@ -954,7 +1008,7 @@ private:
             if (map_data.count("left_wrist_after_ik") && map_data["left_wrist_after_ik"].type == msgpack::type::ARRAY) {
                 try {
                     auto nested_arr = map_data["left_wrist_after_ik"].as<std::vector<std::vector<double>>>();
-                    if (nested_arr.size() == 4 && nested_arr[0].size() == 4) {
+                    if (is_4x4_matrix(nested_arr)) {
                         // Flatten 4x4 matrix to 1D array (row-major)
                         size_t idx = 0;
                         for (const auto& row : nested_arr) {
@@ -962,7 +1016,7 @@ private:
                                 msg.left_wrist_after_ik[idx++] = val;
                             }
                         }
-                        msg.has_ik_data = true;
+                        has_left_wrist_after_ik = true;
                     }
                 } catch (const std::exception& e) {
                     if constexpr (DEBUG_LOGGING) {
@@ -974,7 +1028,7 @@ private:
             if (map_data.count("right_wrist_after_ik") && map_data["right_wrist_after_ik"].type == msgpack::type::ARRAY) {
                 try {
                     auto nested_arr = map_data["right_wrist_after_ik"].as<std::vector<std::vector<double>>>();
-                    if (nested_arr.size() == 4 && nested_arr[0].size() == 4) {
+                    if (is_4x4_matrix(nested_arr)) {
                         // Flatten 4x4 matrix to 1D array (row-major)
                         size_t idx = 0;
                         for (const auto& row : nested_arr) {
@@ -982,7 +1036,7 @@ private:
                                 msg.right_wrist_after_ik[idx++] = val;
                             }
                         }
-                        msg.has_ik_data = true;
+                        has_right_wrist_after_ik = true;
                     }
                 } catch (const std::exception& e) {
                     if constexpr (DEBUG_LOGGING) {
@@ -994,7 +1048,7 @@ private:
             if (map_data.count("head_after_ik") && map_data["head_after_ik"].type == msgpack::type::ARRAY) {
                 try {
                     auto nested_arr = map_data["head_after_ik"].as<std::vector<std::vector<double>>>();
-                    if (nested_arr.size() == 4 && nested_arr[0].size() == 4) {
+                    if (is_4x4_matrix(nested_arr)) {
                         // Flatten 4x4 matrix to 1D array (row-major)
                         size_t idx = 0;
                         for (const auto& row : nested_arr) {
@@ -1002,7 +1056,7 @@ private:
                                 msg.head_after_ik[idx++] = val;
                             }
                         }
-                        msg.has_ik_data = true;
+                        has_head_after_ik = true;
                     }
                 } catch (const std::exception& e) {
                     if constexpr (DEBUG_LOGGING) {
@@ -1015,7 +1069,7 @@ private:
             if (map_data.count("left_wrist") && map_data["left_wrist"].type == msgpack::type::ARRAY) {
                 try {
                     auto nested_arr = map_data["left_wrist"].as<std::vector<std::vector<double>>>();
-                    if (nested_arr.size() == 4 && nested_arr[0].size() == 4) {
+                    if (is_4x4_matrix(nested_arr)) {
                         // Flatten 4x4 matrix to 1D array (row-major)
                         size_t idx = 0;
                         for (const auto& row : nested_arr) {
@@ -1023,7 +1077,7 @@ private:
                                 msg.left_wrist[idx++] = val;
                             }
                         }
-                        msg.has_wrist_matrices = true;
+                        has_left_wrist_matrix = true;
                     }
                 } catch (const std::exception& e) {
                     if constexpr (DEBUG_LOGGING) {
@@ -1035,7 +1089,7 @@ private:
             if (map_data.count("right_wrist") && map_data["right_wrist"].type == msgpack::type::ARRAY) {
                 try {
                     auto nested_arr = map_data["right_wrist"].as<std::vector<std::vector<double>>>();
-                    if (nested_arr.size() == 4 && nested_arr[0].size() == 4) {
+                    if (is_4x4_matrix(nested_arr)) {
                         // Flatten 4x4 matrix to 1D array (row-major)
                         size_t idx = 0;
                         for (const auto& row : nested_arr) {
@@ -1043,7 +1097,7 @@ private:
                                 msg.right_wrist[idx++] = val;
                             }
                         }
-                        msg.has_wrist_matrices = true;
+                        has_right_wrist_matrix = true;
                     }
                 } catch (const std::exception& e) {
                     if constexpr (DEBUG_LOGGING) {
@@ -1052,6 +1106,15 @@ private:
                 }
             }
             
+            // A partial transform set must not activate encoder mode 1. Missing
+            // matrices otherwise retain identity defaults and silently create
+            // invalid whole-body targets.
+            msg.has_ik_data = has_left_wrist_after_ik &&
+                              has_right_wrist_after_ik &&
+                              has_head_after_ik;
+            msg.has_wrist_matrices = has_left_wrist_matrix &&
+                                     has_right_wrist_matrix;
+
             // Extract base_height_command (double)
             if (map_data.count("base_height_command")) {
                 msg.base_height_command = map_data["base_height_command"].as<double>();

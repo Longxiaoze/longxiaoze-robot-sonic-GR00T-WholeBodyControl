@@ -21,6 +21,29 @@ int main(int argc, char** argv) {
     std::cout << "🚀 Testing REAL ROS2InputHandler Class (with PRODUCTION FastRTPS Config)" << std::endl;
     std::cout << "=========================================================================" << std::endl;
     
+    // Pure contract checks: navigation-only messages must remain in planner
+    // encoder mode 0, while complete VR payloads may select mode 1.
+    ControlGoalMsg navigation_goal;
+    if (ROS2InputHandler::HasUsableVRPayload(navigation_goal, true)) {
+        std::cerr << "❌ Navigation-only goal was misclassified as VR input" << std::endl;
+        return 1;
+    }
+    ControlGoalMsg ik_goal;
+    ik_goal.has_ik_data = true;
+    if (!ROS2InputHandler::HasUsableVRPayload(ik_goal, true) ||
+        ROS2InputHandler::HasUsableVRPayload(ik_goal, false)) {
+        std::cerr << "❌ IK payload classification failed" << std::endl;
+        return 1;
+    }
+    ControlGoalMsg raw_wrist_goal;
+    raw_wrist_goal.has_wrist_matrices = true;
+    if (!ROS2InputHandler::HasUsableVRPayload(raw_wrist_goal, false) ||
+        ROS2InputHandler::HasUsableVRPayload(raw_wrist_goal, true)) {
+        std::cerr << "❌ Raw wrist payload classification failed" << std::endl;
+        return 1;
+    }
+    std::cout << "✅ Navigation/VR payload mode classification passed" << std::endl;
+
     // Initialize ROS2 first
     rclcpp::init(argc, argv);
     std::cout << "💡 Press Ctrl+C to stop the test early" << std::endl;
@@ -44,14 +67,17 @@ int main(int argc, char** argv) {
     
     try {
         // Create the actual ROS2InputHandler instance using real class
-        // Parameters: use_ik_mode (false), node_name, initial_encoder_mode (1 for 3-point tracking)
+        // Parameters: raw-wrist mode (false) and an isolated ROS node name.
         auto input_handler = std::make_unique<ROS2InputHandler>(false, "test_real_ros2_handler");
         std::cout << "✅ ROS2InputHandler created successfully!" << std::endl;
         std::cout << "📡 Subscribed to topic: ControlPolicy/upper_body_pose (msgpack format)" << std::endl;
         std::cout << "🔍 ROS2 Status: " << (rclcpp::ok() ? "OK" : "ERROR") << std::endl;
         // Create minimal instances needed for handle_input() test (using actual classes)
         MotionDataReader motion_reader;
-        std::shared_ptr<const MotionSequence> current_motion = nullptr;
+        auto test_motion = std::make_shared<MotionSequence>();
+        test_motion->name = "test_motion";
+        test_motion->SetEncodeMode(0);
+        std::shared_ptr<const MotionSequence> current_motion = test_motion;
         bool reinitialize_heading = false;
         int current_frame = 0;
         OperatorState operator_state; // No namespace needed
@@ -86,6 +112,8 @@ int main(int argc, char** argv) {
                 std::cout << "📊 Loop " << loop_count 
                           << " | Control goal valid: " << (input_handler->is_receiving_control_goal_data() ? "✅" : "❌")
                           << " | Planner: " << (planner_state.enabled ? "✅" : "❌")
+                          << " | VR 3-point: " << (input_handler->HasVR3PointControl() ? "✅" : "❌")
+                          << " | Encoder mode: " << current_motion->GetEncodeMode()
                           << std::endl;
             }
             
@@ -118,4 +146,3 @@ int main(int argc, char** argv) {
 }
 
 #endif
-
